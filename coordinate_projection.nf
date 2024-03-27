@@ -13,14 +13,15 @@ process	liftOver {
 	path chain
 
 	output:
-	tuple val(storeDir), path ("${bed.baseName}_LOap_coord.bed"), emit: newCoords
+	tuple val(storeDir), path (params.suffix ? "${bed.baseName}"+params.suffix+".bed" : "${bed.baseName}_LOap_coord.bed"), emit: newCoords
 	val storeDir, emit: storeDir
 	path ("${bed.baseName}_ap_unmapped.bed")
 
 	script:
+    def args = task.ext.args ?: ''
+	def out  = params.suffix ? "${bed.baseName}"+params.suffix+".bed" : "${bed.baseName}_LOap_coord.bed"
 	"""
-		# liftOver -bedPlus=3 -tab ${bed} $chain ${bed.baseName}_LO_coord.bed ${bed.baseName}_unmapped.bed
-		liftOver -multiple -minMatch=0.01 -bedPlus=3 -tab ${bed} $chain ${bed.baseName}_LOap_coord.bed ${bed.baseName}_ap_unmapped.bed
+		liftOver $args -bedPlus=3 -tab ${bed} $chain ${out} ${bed.baseName}_ap_unmapped.bed
 	"""
 }
 
@@ -37,12 +38,12 @@ process	pslMap {
 	path chain
 
 	output:
-	tuple val(storeDir), path (params.swapMap ? "${psl.baseName}_PMs_coord.psl" : "${psl.baseName}_PMns_coord.psl"), emit: newCoords
+	tuple val(storeDir), path (params.suffix ? "${psl.baseName}"+params.suffix+".psl" : (params.swapMap ? "${psl.baseName}_PMs_coord.psl" : "${psl.baseName}_PMns_coord.psl")), emit: newCoords
 	val storeDir, emit: storeDir
 
 	script:
 	def args = params.swapMap ? '-chainMapFile -swapMap' : '-chainMapFile'
-	def out  = params.swapMap ? "${psl.baseName}_PMs_coord.psl" : "${psl.baseName}_PMns_coord.psl"
+	def out  = params.suffix ? "${psl.baseName}"+params.suffix+".psl" : (params.swapMap ? "${psl.baseName}_PMs_coord.psl" : "${psl.baseName}_PMns_coord.psl")
 	"""
 		pslMap $args -mapInfo=${psl.baseName}_mapInfo.file $psl $chain ${out}
 	"""
@@ -76,7 +77,7 @@ process pslToBed {
 
 	script:
 	"""
-		pslToBed $psl ${psl.baseName}.bed
+		psl2bed --split < $psl > ${psl.baseName}.bed
 	"""
 }
 
@@ -195,8 +196,27 @@ process coverageBed_rev{
 
 	script:
 	"""	
-		# from v30(?) on a and b are swapped
+		# from v2.24 on a and b are swapped
 		bedtools coverage -a <(sort -k1,1 -k2,2n ${ref_bed} | cut -f1,2,3,4) -b <(sort -k1,1 -k2,2n query.bed | cut -f1,2,3,4) > overlap_${ref_bed.baseName}_to_${query_name}.coverage
+	"""
+}
+
+process jaccard{
+	container params.bedTools_container
+
+	input:
+	tuple val(ref_name) , path(ref_bed) , val(query_name), file("query.bed") 
+
+
+	output:
+	stdout
+
+	script:
+	"""	
+		sort -k1,1 -k2,2n $ref_bed | cut -f1,2,3,4 > sorted_$ref_bed
+		sort -k1,1 -k2,2n query.bed | cut -f1,2,3,4 > sorted_query.bed
+		echo -en $ref_name\$"\\t"$query_name\$"\\t";
+		bedtools jaccard -b sorted_${ref_bed} -a sorted_query.bed | cut -f3 | tail -n1
 	"""
 }
 
@@ -221,7 +241,7 @@ def filterFiles( f_list ) {
 }
 
 
-def matrixOutput( data_list_prec , data_list_sens , genome_data_input) {
+def matrixOutput( data_jaccard, data_list_prec , data_list_sens , genome_data_input) {
 	println "Precision"
 	genomeData = genome_data_input.toSpreadMap()
 	prev = data_list_prec[0][0]
@@ -238,6 +258,14 @@ def matrixOutput( data_list_prec , data_list_sens , genome_data_input) {
 	data_list_sens.each { if(it[0] == prev) {System.out.print "${it[2]}\t"} else {System.out.print "${genomeData.get(prev)}\n${it[0]}\t${it[2]}\t"; prev = it[0]} }
 	System.out.print "${genomeData.get(prev)}\ngenome"
 	data_list_sens.each { if(it[0] == prev) {System.out.print "\t${genomeData.get(it[1]) ?: genomeData.get(it[1].split('_')[1])}"} else {} }
+	println ""
+	println "Jaccard"
+	prev = data_jaccard[0][0]
+	data_jaccard.each { if(it[0] == prev) {System.out.print "\t${it[1]}"} else {} }
+	System.out.print "\tgenome\n$prev\t"
+	data_jaccard.each { if(it[0] == prev) {System.out.print "${it[2]}\t"} else {System.out.print "${genomeData.get(prev)}\n${it[0]}\t${it[2]}\t"; prev = it[0]} }
+	System.out.print "${genomeData.get(prev)}\ngenome"
+	data_jaccard.each { if(it[0] == prev) {System.out.print "\t${genomeData.get(it[1]) ?: genomeData.get(it[1].split('_')[1])}"} else {} }
 	println ""
 }
 
@@ -267,7 +295,6 @@ workflow {
 	  			qry:	it.parent.parent == file(params.queryTissues)
 	  			other:	true  }
 			| set {ch_intersectedFiles} 
-
 
 	if ( params.full_intersection ) {
 		ch_intersected_qryRegionFiles = tissues.flatMap { t -> filterFiles( file(t[2] + "/*.bed") ) }
@@ -301,13 +328,18 @@ workflow {
 		 							ch_lifted_qry_merged.map{ t -> tuple(t.baseName.contains("_qryIntrsct") ? t.baseName : t.parent.baseName+"_"+t.baseName, t) } )
 		cov_file_rev = coverageBed_rev( ch_refRegionFiles.mix(ch_intersectedFiles.ref) , 
 				 						ch_lifted_qry_merged.map{ t -> tuple(t.baseName.contains("_qryIntrsct") ? t.baseName : t.parent.baseName+"_"+t.baseName, t) } )
+		jaccard( ch_refRegionFiles.mix(ch_intersectedFiles.ref).map{ t -> tuple(t.baseName.contains("_refIntrsct") ? t.baseName : t.parent.baseName+"_"+t.baseName, t) }
+					.combine( ch_lifted_qry_merged.map{ t -> tuple(t.baseName.contains("_qryIntrsct") ? t.baseName : t.parent.baseName+"_"+t.baseName, t) } ) )
 	} else {
 		cov_file 	 = coverageBed( ch_intersectedFiles.ref ,
 				 					ch_lifted_qry_merged.map{ t -> tuple(t.baseName.contains("_qryIntrsct") ? t.baseName : t.parent.baseName+"_"+t.baseName, t) } )
 		cov_file_rev = coverageBed_rev( ch_intersectedFiles.ref , 
 				 						ch_lifted_qry_merged.map{ t -> tuple(t.baseName.contains("_qryIntrsct") ? t.baseName : t.parent.baseName+"_"+t.baseName, t) } )
+		jaccard( ch_intersectedFiles.ref.map{ t -> tuple(t.baseName.contains("_refIntrsct") ? t.baseName : t.parent.baseName+"_"+t.baseName, t) }
+					.combine( ch_lifted_qry_merged.map{ t -> tuple(t.baseName.contains("_qryIntrsct") ? t.baseName : t.parent.baseName+"_"+t.baseName, t) } ) )
 	}
 
+			 
 	peak_overlap = Channel.empty()
     if (params.compute_overlap == 'base') {
 		peak_overlap 	 = get_base_overlap_prec(cov_file)
@@ -345,9 +377,16 @@ workflow {
 		.map { it -> [0, it]}
 		.set{ch_sens_data} 
 
-	ch_prec_data.join(ch_sens_data, by:0)
+	jaccard.out
+		.splitCsv(sep:'\t')
+		.toSortedList({ x,y -> x[0] <=> y[0] ?: x[1] <=> y[1] })
+		.map{ it -> [0, it]}
+		.set{ch_jaccard_data} 
+
+	ch_jaccard_data.join(ch_prec_data, by:0)
+				.join(ch_sens_data, by:0)
 				.join(ch_genome_data, by:0)
-				.map{it -> matrixOutput(it[1], it[2], it[3])}
+				.map{it -> matrixOutput(it[1], it[2], it[3], it[4])}
 }
 
 
